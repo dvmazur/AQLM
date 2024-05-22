@@ -13,6 +13,9 @@ FALCON_TYPES = ("falcon", "refinedweb", "refinedwebmodel")
 LLAMA_LIKE = ("llama", "Yi", "mistral", "mixtral", "gemma", "cohere")
 
 
+from src.aq import QuantizedLinear
+
+
 @contextmanager
 def suspend_nn_inits():
     def skip(*args, **kwargs):
@@ -42,7 +45,13 @@ def dispatch_quantized_model(model):
 
 
 def get_model(
-    model_path, load_quantized=None, dtype="auto", device_map=None, attn_implementation=None, trust_remote_code=False
+    model_path,
+    load_quantized=None,
+    dtype="auto",
+    device_map=None,
+    attn_implementation=None,
+    trust_remote_code=False,
+    load_finetuned_quantized=None,
 ):
     if dtype == "auto":
         dtype = (
@@ -71,6 +80,11 @@ def get_model(
             print("Initializing model with random weights...")
             print("Loading quantized model ...")
             model = load_quantized_model(model, load_quantized)
+            if load_finetuned_quantized:
+                model.load_state_dict(torch.load(load_finetuned_quantized), strict=False)
+
+            dequantize_quantized_model(model)
+
             if device_map == "auto":
                 assert model.config.model_type in LLAMA_LIKE, "Dispatching is implemented only for Llama-like models."
                 model = dispatch_quantized_model(model)
@@ -243,6 +257,23 @@ def load_quantized_model(model, load_path):
         )
     model.load_state_dict(torch.load(os.path.join(load_path, "not_quantized_weights.pt")), strict=False)
     return model
+
+
+def dequantize_quantized_model(model):
+    """Dequantize quantized model"""
+    for module in list(model.modules()):
+        for child_name, child in list(module.named_children()):
+            if isinstance(child, QuantizedLinear):
+                dequantized_linear = nn.Linear(
+                    in_features=child.in_features, out_features=child.out_features,
+                    bias=child.bias is not None,
+                    dtype=child.quantized_weight.get_codebooks().dtype,
+                    device=next(child.parameters()).device
+                )
+                dequantized_linear.weight.data[...] = child.quantized_weight()
+                if child.bias is not None:
+                    dequantized_linear.bias.data[...] = child.bias
+                setattr(module, child_name, dequantized_linear)
 
 
 def save_not_quantized_weights(model: nn.Module, save_dir: str):
